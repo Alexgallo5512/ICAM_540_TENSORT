@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Video_Optimizado (CUDA)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Video_Optimizado.py",
+            "python": "${workspaceFolder}/.venv_tensor/bin/python3",
+            "env": {
+                "LD_LIBRARY_PATH": "${workspaceFolder}/.venv_tensor/lib/python3.10/site-packages/nvidia/cusparselt/lib"
+            },
+            "console": "integratedTerminal"
+        }
+    ]
+}

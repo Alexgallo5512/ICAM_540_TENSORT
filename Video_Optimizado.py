@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🎯 SCRIPT OPTIMIZADO PARA iCAM-540 + YOLO
+Basado en Video_10_YOlO.py con mejoras de rendimiento
+"""
+
+import cv2
+import time
+import threading
+import os
+import torch
+import numpy as np
+from pathlib import Path
+
+
+# ================= CONFIGURACIÓN =================
+print("CUDA:", torch.cuda.is_available())
+print("CUDA conteo:", torch.cuda.device_count())
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+else:
+    print("No hay CUDA disponible")
+# ===== Patch compatibilidad torchvision con torch NVIDIA Jetson (CUDA 12.6) =====
+
+# Patch 1: evita error al registrar operadores meta de torchvision
+import torch._library.fake_impl as _fake_impl_module
+_orig_fake_register = _fake_impl_module.FakeImplHolder.register
+def _patched_fake_register(self, func, source):
+    try:
+        return _orig_fake_register(self, func, source)
+    except RuntimeError:
+        return None
+_fake_impl_module.FakeImplHolder.register = _patched_fake_register
+
+# Patch 2: reemplaza torchvision.ops.nms con implementacion pura PyTorch
+#          (el .so de torchvision no es compatible con el build NVIDIA)
+import torchvision.ops as _tv_ops
+def _nms_puro(boxes, scores, iou_threshold):
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0].item()
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        xx1 = boxes[order[1:], 0].clamp(min=boxes[i, 0])
+        yy1 = boxes[order[1:], 1].clamp(min=boxes[i, 1])
+        xx2 = boxes[order[1:], 2].clamp(max=boxes[i, 2])
+        yy2 = boxes[order[1:], 3].clamp(max=boxes[i, 3])
+        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+        areas = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
+        iou = inter / (area_i + areas - inter)
+        order = order[1:][iou <= iou_threshold]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+_tv_ops.nms = _nms_puro
+
+# ============================================================================
+
+from ultralytics import YOLO
+MODEL_PATH = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.pt"
+
+# ✅ Rutas Compatible Windows/Linux
+SAVE_PATH = "/home/icam-540/capturas/captura_sin_tapa.jpg"
+
+# Resolución cámara (reducida para mejor rendimiento)
+WIDTH  = 1280   
+HEIGHT = 720   
+# Tamaño YOLO (pequeño = procesamiento rápido)
+YOLO_SIZE_W = 640 
+YOLO_SIZE_H = 480 
+YOLO_CONF = 0.7  # Confianza mínima (> 0.5 = más rápido)
+
+
+
+# ================= VARIABLES GLOBALES =================
+model = YOLO(MODEL_PATH)
+# model.export(format="engine", device=0)  # GPU
+# model = YOLO("best.engine")
+
+latest_frame = None
+detection_event = threading.Event()
+
+# Contadores FPS
+cam_fps = 0
+yolo_fps = 0
+cam_count = 0
+yolo_count = 0
+last_fps_time = time.time()
+
+icam_color = 0
+
+gain =1
+sharpness =5
+brightness =10
+resized_2 = None
+# ================= FUNCIONES =================
+ultimo_frame = None
+frame_yolo = None
+resized = None
+
+def calculo_posicion_obj(x1,y1,x2,y2,class_name):
+    global frame_yolo
+   
+
+    cx = int((x1 + x2 )/ 2)
+    cy = int((y1 + y2 )/ 2)
+
+    if class_name == "Sin_Tapa":
+        cv2.circle(frame_yolo,(int(x1),int(y1)),10,(27,34,234), 2)
+        cv2.circle(frame_yolo,(int(x2),int(y2)),10,(19,4,10), 2)
+        cv2.circle(frame_yolo,(cx,cy),10,(255,0,0), 2)
+        print(f"Objeto sin tapa en X:{cx}, Y {cy}")
+    else:
+        cv2.circle(frame_yolo,(int(x1),int(y1)),10,(255,34,234), 2)
+        cv2.circle(frame_yolo,(int(x2),int(y2)),10,(195,4,10), 2)
+        cv2.circle(frame_yolo,(cx,cy),10,(255,0,0), 2)
+        print(f"Objeto con tapa en X:{cx}, Y {cy}")
+    
+
+def gst_to_opencv(sample):
+    """Convierte formato SDK (GST) a formato OpenCV"""
+    buf = sample.get_buffer()
+    data = buf.extract_dup(0, buf.get_size())
+    arr = np.frombuffer(data, dtype=np.uint8)
+
+    if icam_color == 1:
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    else:
+        return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+
+
+def new_image_handler(sample):
+    """
+    Callback de CÁMARA (debe ser LIVIANO, sin YOLO aquí)
+    Solo captura frames, procesamiento en main loop
+    """
+    global latest_frame, cam_count
+
+    if sample is None:
+        return
+
+    try:
+        frame = gst_to_opencv(sample)
+        latest_frame = frame
+
+        cam_count += 1
+        
+    except Exception as e:
+        print(f"❌ Error en callback cámara: {e}")
+
+
+def save_detection(frame, class_name="Sin_Tapa"):
+    """Guarda imagen de detección"""
+    try:
+        cv2.imwrite(str(SAVE_PATH), frame)
+        print(f"✅ Detección guardada: {SAVE_PATH}")
+        detection_event.set()
+    except Exception as e:
+        print(f"❌ Error al guardar: {e}")
+
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    print("🚀 Iniciando iCAM-540 + YOLO con threading...")
+
+    bandera_Yolo = False
+    count_rechazo = 0
+    linea_cero = 0
+    linea_uno = 1
+    count_sin_tapa = 0
+    count_con_tapa = 0
+    try:
+        from CamNavi2 import CamNavi2
+        try:
+            cn2 = CamNavi2.CamNavi2()
+        except:
+            cn2 = CamNavi2()
+    except ImportError:
+        print("❌ Error: No se encontró CamNavi2. Instala el SDK de iCAM-540")
+        exit(1)
+
+    try:
+        # Obtener cámara
+        camera_list = cn2.enum_camera_list()
+        if not camera_list:
+            print("❌ No se encontró cámara iCAM")
+            exit(1)
+        
+        camera = cn2.get_device_by_name("iCam500")  # O "iCam540" si es 540
+        print(f"✅ Cámara detectada: {camera}")
+
+        # Verificar color/mono
+        icam_color = int(cn2.advcam_query_fw_sku(camera))
+        print(f"📷 Modo: {'Color' if icam_color == 1 else 'Mono'}")
+
+        # ========== CONFIGURAR PIPELINE ==========
+        pipe_params = {
+            "acq_mode": 0,
+            "width": WIDTH,
+            "height": HEIGHT,
+            "enable_infer": 0  # IMPORTANTE: sin inferencia en cámara
+        }
+
+        if icam_color == 1:
+            pipe_params["format"] = "YUY2"
+
+        cn2.advcam_config_pipeline(camera, **pipe_params)
+        cn2.advcam_open(camera, -1)
+        cn2.advcam_register_new_image_handler(camera, new_image_handler)
+        camera.dio.do0.op_mode = 0
+        camera.dio.do0.user_output = 0 # DO low, DI high
+        print("DO lOW " + str(camera.dio.do0.user_output))
+        camera.dio.do0.reverse = 0
+        # ========== CONFIGURACIÓN ÓPTICA ==========
+        camera.lighting.selector = 3
+        camera.lighting.gain = 10
+
+        camera.image.saturation = 119
+        camera.image.gamma = 24
+        
+        cn2.advcam_set_img_sharpness(camera, 15)
+        cn2.advcam_set_img_brightness(camera, 80)
+        cn2.advcam_set_img_gain(camera, 6)
+
+        #camera.set_acq_frame_rate(TARGET_FPS)
+
+        # ========== INICIAR CAPTURA ==========
+        
+        camera.focus.pos_zero()
+        time.sleep(0.5)
+        camera.focus.distance = 65
+        i = 0
+        while i < 7:
+            
+            camera.focus.direction = 1 # lens focusing motor backward
+            try:
+                camera.focus.distance = 100
+                print("lens motor posistion: ", camera.focus.position())
+                i+=1
+                print("valor ", i)
+            except ValueError:
+                print("lens position out of index")
+        
+        cn2.advcam_play(camera)
+        print("▶️  Sistema iniciado. Presiona ESC para salir")
+        print(f"   📊 Resolución cámara: {WIDTH}x{HEIGHT}")
+        print(f"   🧠 Tamaño YOLO: {YOLO_SIZE_W}x{YOLO_SIZE_H}")
+        print(f"   ⚙️  Confianza YOLO: {YOLO_CONF}")
+        print()
+        bandera = False
+        # ================= LOOP PRINCIPAL =================
+        while True:
+            if latest_frame is not None:
+                count_rechazo+=1
+                if count_rechazo == 2 and  str(camera.dio.do0.user_output) == "1":
+                    camera.dio.do0.user_output = 0
+                    salida  = str(camera.dio.do0.user_output)
+                    print("DO Low " + salida)
+
+                if resized_2 is not None:
+                    diff = cv2.absdiff(resized,resized_2)
+                    gray = cv2.cvtColor(diff,cv2.COLOR_BGR2GRAY)
+
+                    _, thresh = cv2.threshold(gray,15,255,cv2.THRESH_BINARY)
+
+                    porcentaje = np.sum(thresh > 0) / thresh.size
+                    print(porcentaje)
+                    if porcentaje > 0.07:
+                        bandera_Yolo = False
+           
+
+                resized = cv2.resize(latest_frame, (YOLO_SIZE_W, YOLO_SIZE_H))
+
+                if bandera_Yolo == False:
+                    
+                    results = model(resized, verbose=False, conf=YOLO_CONF)    # conf -> Confianza mínima = más rápido
+
+                    frame_yolo = results[0].plot()
+                    bandera_Yolo = True
+                    resized_2 = resized.copy() 
+
+
+                    for i,cls_id in enumerate(results[0].boxes.cls.tolist()):
+                        class_name = results[0].names[int(cls_id)]
+                        cof = results[0].boxes.conf[i].item()
+                        if class_name == "Sin_Tapa":
+                            print(f"🎯 Objeto detectado: {class_name} - Confianza {cof:.2f}")
+                            #save_detection(frame_yolo, class_name)
+                            count_sin_tapa+=1
+                            count_rechazo = 0
+                            camera.dio.do0.user_output = 1
+                            salida  = str(camera.dio.do0.user_output)
+                            print("DO high " + salida)
+                            x1,y1,x2,y2 = results[0].boxes.xyxy[i].tolist()
+                            calculo_posicion_obj(x1,y1,x2,y2,class_name)
+                        if class_name == "Con_Tapa":
+                            print(f"🎯 Objeto detectado: {class_name} - Confianza {cof:.2f}")
+                            count_con_tapa+=1
+                            x1,y1,x2,y2 = results[0].boxes.xyxy[i].tolist()
+                            calculo_posicion_obj(x1,y1,x2,y2,class_name)
+                            
+
+                    cv2.imshow("Vista Camara",frame_yolo)
+                    print(f"Con tapa :{count_con_tapa}, Sin Tapa {count_sin_tapa}")
+                else:
+
+                    if frame_yolo is not None:
+                        cv2.imshow("Vista Camara",frame_yolo)
+                    else:
+
+                        cv2.imshow("Vista Camara",resized)
+
+            # -------- CONTROLES TECLADO --------
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                print("\n⏹️  Deteniendo...")
+                break
+            elif key == ord('a') or key == ord('A'):  # Enfoque RETROCEDE
+                try:
+                    camera.focus.direction = 0
+                    camera.focus.distance = 5
+                    print("lens motor Retrocede posistion: ", camera.focus.position())
+                except:
+                    pass
+            elif key == ord('b') or key == ord('B'):  # Enfoque ADELANTA
+                try:
+                    camera.focus.direction = 1
+                    camera.focus.distance = 5
+                    print("lens motor Adelante posistion: ", camera.focus.position())
+                except:
+                    pass
+
+                #GAIN
+            elif key == ord('n') or key == ord('N'):  # GAIN AUMENTAR
+                try:
+
+                    gain_a = cn2.advcam_get_img_gain(camera)
+                    gain_a = gain_a + gain
+                    cn2.advcam_set_img_gain(camera, gain_a)
+                    print("gain aumento: ", cn2.advcam_get_img_gain(camera))
+                except Exception as e:
+                    print(f"❌ Error gain  a: {e}")
+                    pass
+            elif key == ord('m') or key == ord('M'):  # GAIN DISMINUIR
+                try:
+
+                    gain_a = cn2.advcam_get_img_gain(camera)
+                    gain_a = gain_a - gain
+                    cn2.advcam_set_img_gain(camera, gain_a)
+                    print("gain disminuir: ", cn2.advcam_get_img_gain(camera))
+                except Exception as e:
+                    print(f"❌ Error gain d: {e}")
+                    pass
+
+                #SHARPNESS
+            elif key == ord('v') or key == ord('V'):  # SHARPNESS AUMENTAR
+                try:
+
+                    sharpness_a = cn2.advcam_get_img_sharpness(camera)
+                    sharpness_a = sharpness_a + sharpness
+                    cn2.advcam_set_img_sharpness(camera, sharpness_a)
+                    print("sharpness aumento: ", cn2.advcam_get_img_sharpness(camera))
+                except Exception as e:
+                    print(f"❌ Error sharpness  a: {e}")
+                    pass
+            elif key == ord('c') or key == ord('C'):  # SHARPNESS DISMINUIR
+                try:
+
+                    sharpness_a = cn2.advcam_get_img_sharpness(camera)
+                    sharpness_a = sharpness_a - sharpness
+                    cn2.advcam_set_img_sharpness(camera, sharpness_a)
+                    print("sharpness disminuir: ", cn2.advcam_get_img_sharpness(camera))
+                except Exception as e:
+                    print(f"❌ Error sharpness d: {e}")
+                    pass
+
+                #BRIGTHNESS
+            elif key == ord('x') or key == ord('X'):  # BRIGTHNESS AUMENTAR
+                try:
+
+                    brightness_a = cn2.advcam_get_img_brightness(camera)
+                    brightness_a = brightness_a + brightness
+                    cn2.advcam_set_img_brightness(camera, brightness_a)
+                    print("brightness aumento: ", cn2.advcam_get_img_brightness(camera))
+                except Exception as e:
+                    print(f"❌ Error brightness  a: {e}")
+                    pass
+            elif key == ord('z') or key == ord('X'):  # BRIGTHNESS DISMINUIR
+                try:
+
+                    brightness_a = cn2.advcam_get_img_brightness(camera)
+                    brightness_a = brightness_a - brightness
+                    cn2.advcam_set_img_brightness(camera, brightness_a)
+                    print("brightness disminuir: ", cn2.advcam_get_img_brightness(camera))
+                except Exception as e:
+                    print(f"❌ Error brightness d: {e}")
+                    pass    
+            elif key == ord('s'):  # Captura manual
+                if latest_frame is not None:
+                    save_detection(frame_yolo, "Manual")
+            elif key == ord('t'):  
+                    
+                    camera.dio.do0.user_output = 1
+                    salida  = str(camera.dio.do0.user_output)
+                    print("DO high " + salida)
+                    #camera.dio.do0.user_output = 1 # DO high, DI low
+                    level =  camera.dio.di0.level
+                    print(level)
+            elif key == ord('r'):  
+                    camera.dio.do0.user_output = 0
+                    salida  = str(camera.dio.do0.user_output)
+                    print("DO low " + salida)
+                    #camera.dio.do0.user_output = 1 # DO high, DI low
+                    level =  camera.dio.di0.level
+                    print(level)
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        # ========== LIMPIEZA ==========
+        print("\n🧹 Limpiando recursos...")
+        try:
+            camera.lighting.selector = 0
+            cn2.advcam_register_new_image_handler(camera, None)
+            cn2.advcam_close(camera)
+        except:
+            pass
+        cv2.destroyAllWindows()
+        print("✅ Finalizado")

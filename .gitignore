@@ -1,0 +1,8 @@
+env/
+venv/
+yolo_env/
+__pycache__/
+*.pyc
+.venv/
+.venv_tensor/
+*.pyo
