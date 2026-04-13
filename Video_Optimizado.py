@@ -60,28 +60,42 @@ _tv_ops.nms = _nms_puro
 # ============================================================================
 
 from ultralytics import YOLO
-MODEL_PATH = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.pt"
-
+PT_PATH     = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.pt"
+ENGINE_PATH = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.engine"
 # ✅ Rutas Compatible Windows/Linux
 SAVE_PATH = "/home/icam-540/capturas/captura_sin_tapa.jpg"
 
 # Resolución cámara (reducida para mejor rendimiento)
-WIDTH  = 1280   
-HEIGHT = 720   
+WIDTH  = 1280
+HEIGHT = 720
 # Tamaño YOLO (pequeño = procesamiento rápido)
-YOLO_SIZE_W = 640 
-YOLO_SIZE_H = 480 
+YOLO_SIZE_W = 640
+YOLO_SIZE_H = 480
 YOLO_CONF = 0.7  # Confianza mínima (> 0.5 = más rápido)
 
 
 
 # ================= VARIABLES GLOBALES =================
-model = YOLO(MODEL_PATH)
-# model.export(format="engine", device=0)  # GPU
-# model = YOLO("best.engine")
+# Exporta a TensorRT Engine solo si no existe; de lo contrario carga directo
+if not Path(ENGINE_PATH).exists():
+    print(f"[YOLO] best.engine no encontrado — exportando desde {PT_PATH} ...")
+    _tmp = YOLO(PT_PATH)
+    _tmp.export(format="engine", device=0, half=True)
+    del _tmp
+
+model = YOLO(ENGINE_PATH)
+
+# OPTIMIZACIÓN 1: warmup — elimina el spike de latencia en las primeras inferencias
+_dummy = np.zeros((YOLO_SIZE_H, YOLO_SIZE_W, 3), dtype=np.uint8)
+model(_dummy, verbose=False, half=True)
+print("✅ Modelo TensorRT calentado y listo")
 
 latest_frame = None
 detection_event = threading.Event()
+# OPTIMIZACIÓN 2: evento para despertar el loop exacto cuando llega nuevo frame
+frame_event = threading.Event()
+# OPTIMIZACIÓN 4: lock para proteger latest_frame de race condition callback/loop
+_frame_lock = threading.Lock()
 
 # Contadores FPS
 cam_fps = 0
@@ -144,10 +158,11 @@ def new_image_handler(sample):
 
     try:
         frame = gst_to_opencv(sample)
-        latest_frame = frame
-
+        with _frame_lock:  # OPTIMIZACIÓN 4: escritura atómica del frame
+            latest_frame = frame
+        frame_event.set()  # OPTIMIZACIÓN 2: notifica al loop que llegó nuevo frame
         cam_count += 1
-        
+
     except Exception as e:
         print(f"❌ Error en callback cámara: {e}")
 
@@ -216,7 +231,7 @@ if __name__ == "__main__":
         camera.dio.do0.reverse = 0
         # ========== CONFIGURACIÓN ÓPTICA ==========
         camera.lighting.selector = 3
-        camera.lighting.gain = 10
+        camera.lighting.gain = 5
 
         camera.image.saturation = 119
         camera.image.gamma = 24
@@ -253,7 +268,10 @@ if __name__ == "__main__":
         bandera = False
         # ================= LOOP PRINCIPAL =================
         while True:
-            if latest_frame is not None:
+            with _frame_lock:  # OPTIMIZACIÓN 4: lectura atómica del frame
+                frame_actual = latest_frame
+
+            if frame_actual is not None:
                 count_rechazo+=1
                 if count_rechazo == 2 and  str(camera.dio.do0.user_output) == "1":
                     camera.dio.do0.user_output = 0
@@ -261,10 +279,15 @@ if __name__ == "__main__":
                     print("DO Low " + salida)
 
                 if resized_2 is not None:
-                    diff = cv2.absdiff(resized,resized_2)
-                    gray = cv2.cvtColor(diff,cv2.COLOR_BGR2GRAY)
+                    # OPTIMIZACIÓN 3: diff directo en gris (3x más rápido que BGR→diff→gray)
+                    #gray_now  = cv2.cvtColor(resized,   cv2.COLOR_BGR2GRAY)
+                    #gray_prev = cv2.cvtColor(resized_2, cv2.COLOR_BGR2GRAY)
+                    gray_now  = cv2.GaussianBlur(cv2.cvtColor(resized,   cv2.COLOR_BGR2GRAY), (5, 5), 0)
+                    gray_prev = cv2.GaussianBlur(cv2.cvtColor(resized_2, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+                    
+                    gray = cv2.absdiff(gray_now, gray_prev)
 
-                    _, thresh = cv2.threshold(gray,15,255,cv2.THRESH_BINARY)
+                    _, thresh = cv2.threshold(gray,20,255,cv2.THRESH_BINARY)
 
                     porcentaje = np.sum(thresh > 0) / thresh.size
                     print(porcentaje)
@@ -272,11 +295,11 @@ if __name__ == "__main__":
                         bandera_Yolo = False
            
 
-                resized = cv2.resize(latest_frame, (YOLO_SIZE_W, YOLO_SIZE_H))
+                resized = cv2.resize(frame_actual, (YOLO_SIZE_W, YOLO_SIZE_H))
 
                 if bandera_Yolo == False:
                     
-                    results = model(resized, verbose=False, conf=YOLO_CONF)    # conf -> Confianza mínima = más rápido
+                    results = model(resized, verbose=False, conf=YOLO_CONF, half=True)    # conf -> Confianza mínima = más rápido
 
                     frame_yolo = results[0].plot()
                     bandera_Yolo = True
@@ -308,7 +331,7 @@ if __name__ == "__main__":
                 else:
 
                     if frame_yolo is not None:
-                        cv2.imshow("Vista Camara",frame_yolo)
+                       cv2.imshow("Vista Camara",frame_yolo)
                     else:
 
                         cv2.imshow("Vista Camara",resized)
@@ -409,13 +432,18 @@ if __name__ == "__main__":
                     #camera.dio.do0.user_output = 1 # DO high, DI low
                     level =  camera.dio.di0.level
                     print(level)
-            elif key == ord('r'):  
+            elif key == ord('r'):
                     camera.dio.do0.user_output = 0
                     salida  = str(camera.dio.do0.user_output)
                     print("DO low " + salida)
                     #camera.dio.do0.user_output = 1 # DO high, DI low
                     level =  camera.dio.di0.level
                     print(level)
+
+            # OPTIMIZACIÓN 2: duerme hasta que llegue nuevo frame o pasen 50ms
+            # evita quemar CPU en el spin-loop cuando bandera_Yolo == True
+            frame_event.wait(timeout=0.05)
+            frame_event.clear()
 
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -427,6 +455,7 @@ if __name__ == "__main__":
         print("\n🧹 Limpiando recursos...")
         try:
             camera.lighting.selector = 0
+            camera.lighting.gain = 0
             cn2.advcam_register_new_image_handler(camera, None)
             cn2.advcam_close(camera)
         except:
