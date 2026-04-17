@@ -66,8 +66,8 @@ ENGINE_PATH = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.engine"
 SAVE_PATH = "/home/icam-540/capturas/captura_sin_tapa.jpg"
 
 # Resolución cámara (reducida para mejor rendimiento)
-WIDTH  = 1280
-HEIGHT = 720
+WIDTH  = 3840
+HEIGHT = 2160
 # Tamaño YOLO (pequeño = procesamiento rápido)
 YOLO_SIZE_W = 640
 YOLO_SIZE_H = 480
