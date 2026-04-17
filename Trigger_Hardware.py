@@ -66,12 +66,12 @@ PT_PATH     = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.pt"
 ENGINE_PATH = "/home/icam-540/Proyectos/ICAM_540_TENSORT/best.engine"
 
 # Resolución cámara (reducida para mejor rendimiento)
-WIDTH  = 640   
-HEIGHT = 640   
+WIDTH  = 640
+HEIGHT = 640  
 # Tamaño YOLO (pequeño = procesamiento rápido)
 YOLO_SIZE_W = 640 
 YOLO_SIZE_H = 480 
-YOLO_CONF = 0.3  # Confianza mínima (> 0.5 = más rápido)
+YOLO_CONF = 0.7  # Confianza mínima (> 0.5 = más rápido)
 
 MUESTRA_IMAGEN = False
 detection_event = threading.Event()
@@ -80,6 +80,7 @@ detection_event = threading.Event()
 # Evita el time.sleep(0.1) fijo y reduce latencia de respuesta al trigger
 frame_event = threading.Event()
 
+_frame_lock = threading.Lock()
 # =========================================
 #  Exporta a TensorRT Engine solo si no existe; de lo contrario carga directo
 #  OPTIMIZACIÓN 3: half=True genera engine FP16 → ~30-50% más rápido en Jetson Orin
@@ -134,7 +135,7 @@ def lectura_Confisistema():
 # OPTIMIZACIÓN 1: Cola de escritura asíncrona a disco
 # El loop principal ya no se bloquea esperando I/O del archivo.
 # Las escrituras se procesan en un hilo separado de fondo (daemon).
-_file_queue = queue.Queue()
+_file_queue = queue.Queue(maxsize=10)
 
 def _writer_thread():
     """Hilo daemon: consume la cola y escribe Conteo_Objetos.txt sin bloquear el loop."""
@@ -156,7 +157,10 @@ threading.Thread(target=_writer_thread, daemon=True, name="FileWriter").start()
 
 def actualizar_linea_archivo(linea, valor):
     """Encola la escritura en lugar de escribir directamente — no bloquea el loop."""
-    _file_queue.put((linea, valor))
+    try:
+        _file_queue.put_nowait((linea, valor))
+    except queue.Full:
+        print("?? Cola escritura llena  escritura descartada")
 
 # ---------- Convert GST buffer to OpenCV ----------
 def gst_to_opencv(sample):
@@ -174,7 +178,8 @@ def new_image_handler(sample):
         return
 
     img = gst_to_opencv(sample)
-    image_arr = img
+    with _frame_lock:
+        image_arr = img
     # OPTIMIZACIÓN 2: notifica al loop principal que llegó un frame nuevo.
     # El loop deja de dormir inmediatamente en lugar de esperar el sleep fijo.
     frame_event.set()
@@ -265,10 +270,8 @@ if __name__ == '__main__':
     print("Delay " + str(camera.hw_trigger_delay))
 
     camera.lighting.selector = int(lista_confi[0])
-    #camera.lighting.selector = 2
-    
-    camera.lighting.gain = 0
-    #camera.lighting.gain = int(lista_confi[1])
+
+    camera.lighting.gain = int(lista_confi[1])
 
     #cn2.advcam_set_img_sharpness(camera, 5)
     #cn2.advcam_set_img_brightness(camera, 250)
@@ -308,9 +311,19 @@ if __name__ == '__main__':
     resized = None
     try:
         while True:
-            if image_arr  is not None:
+            # OPTIMIZACIÓN 2: espera hasta que llegue un frame nuevo (máx 500ms)
+                # Reemplaza el time.sleep(0.1) fijo — el loop despierta exacto con el trigger
+            frame_event.wait(timeout=0.5)
+            frame_event.clear()
+
+
+            with _frame_lock:
+                frame_local = image_arr
+                image_arr = None
+
+            if frame_local  is not None:
                 
-                resized = cv2.resize(image_arr, (YOLO_SIZE_W, YOLO_SIZE_H))
+                resized = cv2.resize(frame_local, (YOLO_SIZE_W, YOLO_SIZE_H))
 
                 if resized_2 is not None:
 
@@ -339,10 +352,6 @@ if __name__ == '__main__':
                         bandera_Yolo = False
 
                
-                #cv2.imshow("Vista Camara",image_arr) 
-                image_arr = None
-
-                
                 if bandera_Yolo == False:
                     # OPTIMIZACIÓN 3: half=True activa inferencia FP16 en cada frame
                     # Aprovecha el engine compilado con half=True → menor latencia por inferencia
@@ -384,7 +393,8 @@ if __name__ == '__main__':
                     break
                 elif key == ord('-'): 
                     cv2.destroyAllWindows()
-                    image_arr = None
+                    with _frame_lock:
+                        image_arr = None
                 elif key == ord('t'):  
                     
                     camera.dio.do0.user_output = 1
@@ -420,7 +430,8 @@ if __name__ == '__main__':
 
                 if key == ord('-'): 
                     cv2.destroyAllWindows()
-                    image_arr = None
+                    with _frame_lock:
+                        image_arr = None
                 elif key == ord('t'):  
                     count_rechazo = 0
                     camera.dio.do0.user_output = 1
@@ -438,13 +449,7 @@ if __name__ == '__main__':
                     print(level)
 
 
-                if  cv2.waitKey(1) & 0xFF == 27:
-                    break
-
-                # OPTIMIZACIÓN 2: espera hasta que llegue un frame nuevo (máx 500ms)
-                # Reemplaza el time.sleep(0.1) fijo — el loop despierta exacto con el trigger
-                frame_event.wait(timeout=0.5)
-                frame_event.clear()
+                
 
     except KeyboardInterrupt:
         pass
